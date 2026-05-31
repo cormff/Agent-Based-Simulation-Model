@@ -1,27 +1,20 @@
 """
 main_orchestrator.py
 ====================
-Simülasyon döngüsünü (Game Loop) yürüten ana orkestratör.
+Simülasyon döngüsünü yürüten ana orkestratör (v2).
 
-Akış (her tur):
-    1. Son tur kayıtları DB'den çekilir.
-    2. Game Master (yerel Ollama) bir kriz olayı üretir (event injection).
-    3. Kriz, Ajan A'nın Gemini API'sine gönderilir; yanıt JSON olarak ayrıştırılır.
-    4. Kriz + A'nın yanıtı, Ajan B'ye asenkron olarak iletilir.
-    5. Internal_Trust_Score / Action / Reasoning / Symmetry_Index + yönlü kenar
-       ağırlıkları (Weight) Round_Logs'a yazılır.
-    6. Çıkış koşulu denetlenir:
-         - Güven puanı eşiğin altına düşerse VEYA bir ajan "TERMINATE" derse
-           -> ilişki kopar (FATAL). Bu, bir SİSTEM ÇÖKMESİ değil; beklenen ve
-           anlamlı bir deney sonucudur (ayrı bir istisna sınıfıyla ayrıştırılır).
-         - 50 tura ulaşılırsa -> STABLE (denklik bağıntısı adayı) işaretlenir ve
-           Yansıma/Simetri/Geçişlilik analizi fiilen çalıştırılır.
+v2 Mimarisi:
+    1. Dinamik İnisiyatif: tek turlarda A, çift turlarda B önce hareket eder.
+       Bu sayede ilk-hamle önyargısı (first-mover bias) ortadan kalkar.
 
-Asenkron paralellik:
-    Tek bir çiftte A -> B sıralı bir bağımlılıktır (B, A'nın hamlesini görür).
-    Gerçek paralellik, BİRDEN FAZLA ajan çiftinin `asyncio.gather` ile aynı anda
-    koşturulmasıyla elde edilir; bu sayede Gemini istekleri kilitlenmeden,
-    semaphore ile sınırlandırılarak yönetilir.
+    2. Deterministik Simetri İndeksi: LLM'den `Symmetry_Index` artık
+       istenmez. `compute_symmetry_index()` son 3 turun eylemlerini
+       karşılaştırarak matematiksel olarak hesaplar.
+
+    3. Geçmiş Travma Enjeksiyonu: Her turdan önce DB'den "10+ tur öncesi,
+       severity >= 8" kriteriyle en yüksek şiddetli kriz sorgulanır ve
+       Game Master'ın promptuna <PAST_TRAUMA> bloğu olarak eklenir.
+       Bu, denklik bağıntısının GEÇİŞLİLİK / AFFETME boyutunu sınar.
 """
 
 from __future__ import annotations
@@ -49,33 +42,48 @@ logger = logging.getLogger("orchestrator")
 
 
 # ===========================================================================
-# Özel istisnalar ve yardımcılar
+# Özel istisnalar
 # ===========================================================================
 class FatalSimulationError(Exception):
     """
     İlişkinin KOPMASINI temsil eder (beklenen terminal durum).
 
-    DİKKAT: Bu bir altyapı hatası DEĞİLDİR. Güven eşiği ihlali veya "TERMINATE"
-    gibi tasarlanmış sonlanma durumlarını, gerçek çökmelerden (LLMClientError)
-    ayırmak için kullanılır.
+    Güven eşiği ihlali veya "TERMINATE" hamlesi bu sınıfla raporlanır.
+    Gerçek altyapı hataları (LLMClientError) ile karıştırılmamalıdır.
     """
 
 
-# Karşı tarafın eylemine göre AJANIN güvenine yansıyan etki (oyun-teorik ödül).
+# ===========================================================================
+# Oyun-teorik sabitler
+# ===========================================================================
 ACTION_TRUST_IMPACT: dict[str, float] = {
-    "COOPERATE": +6.0,
-    "CONCEDE": +4.0,
-    "NEGOTIATE": +1.0,
-    "DEFECT": -10.0,
-    "EXPLOIT_LOOPHOLE": -14.0,
-    "WITHDRAW": -6.0,
-    "TERMINATE": -100.0,
+    "COOPERATE":        +6.0,
+    "CONCEDE":          +4.0,
+    "NEGOTIATE":        +1.0,
+    "DEFECT":          -10.0,
+    "EXPLOIT_LOOPHOLE":-14.0,
+    "WITHDRAW":         -6.0,
+    "TERMINATE":      -100.0,
 }
 VALID_ACTIONS = set(ACTION_TRUST_IMPACT.keys())
 
+# Deterministik Simetri İndeksi için işbirliği puanları [-1, 1].
+# Pozitif = ilişkiyi destekler, negatif = ilişkiyi yıpratır.
+_ACTION_COOP_SCORE: dict[str, float] = {
+    "COOPERATE":        +1.00,
+    "CONCEDE":          +0.50,
+    "NEGOTIATE":        +0.25,
+    "WITHDRAW":         -0.50,
+    "DEFECT":           -0.75,
+    "EXPLOIT_LOOPHOLE": -1.00,
+    "TERMINATE":        -1.00,
+}
 
+
+# ===========================================================================
+# Saf yardımcı fonksiyonlar
+# ===========================================================================
 def _as_float(value: Any, default: float) -> float:
-    """LLM sayıyı string döndürse bile güvenli float'a çevirir."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -87,11 +95,51 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 
 
 def _normalize_action(action: Any) -> str:
-    """Eylemi normalleştirir; tanımsızsa güvenli varsayılana (NEGOTIATE) düşer."""
     if not isinstance(action, str):
         return "NEGOTIATE"
     a = action.strip().upper().replace(" ", "_")
     return a if a in VALID_ACTIONS else "NEGOTIATE"
+
+
+def compute_symmetry_index(
+    history: list[dict[str, Any]],
+    current_a_action: str,
+    current_b_action: str,
+    window: int = 3,
+) -> float:
+    """
+    Deterministik Simetri İndeksi: son `window` turda (mevcut tur dahil)
+    her iki ajanın eylemlerinin ne kadar örtüştüğünü ölçer.
+
+    Formül (her tur için):
+        score(agent) = _ACTION_COOP_SCORE[action]   ∈ [-1, 1]
+        round_sym    = 1.0 - |score_A - score_B| / 2.0   ∈ [0, 1]
+    Simetri İndeksi = ortalama(round_sym, son N tur)
+
+    Yorumlama:
+        1.0 → tam örtüşme (ikisi de işbirlikçi VEYA ikisi de toksik)
+        0.0 → tam asimetri (biri işbirliği yaparken diğeri sömürüyor)
+
+    Bu formül "matched-but-toxic" (her ikisi de defect) durumunu 1.0'a yakın
+    tutar; böylece oyun-teorik "her ikisi de rasyonel" Nash denge noktaları
+    simetrik olarak işaretlenir ve ayrıca izlenebilir.
+    """
+    # Mevcut turu history'ye ekle, son `window` turu al.
+    all_rounds = list(history) + [
+        {"A": {"action": current_a_action}, "B": {"action": current_b_action}}
+    ]
+    recent = all_rounds[-window:]
+
+    total = 0.0
+    for entry in recent:
+        a_act = entry.get("A", {}).get("action", "NEGOTIATE")
+        b_act = entry.get("B", {}).get("action", "NEGOTIATE")
+        sa = _ACTION_COOP_SCORE.get(a_act, 0.0)
+        sb = _ACTION_COOP_SCORE.get(b_act, 0.0)
+        # Maksimum olası fark = 2.0 (+1 ile -1 arasında).
+        total += 1.0 - abs(sa - sb) / 2.0
+
+    return round(total / len(recent), 4)
 
 
 # ===========================================================================
@@ -123,20 +171,17 @@ class SimulationRunner:
 
     # -- Kurulum / İlklendirme -------------------------------------------
     async def setup(self) -> None:
-        """DB'de simülasyonu açar, gizli statülerle ajanları oluşturur."""
         rng = random.Random(self.cfg.random_seed)
         self.sim_id = await self.db.create_simulation(
             label=self.label, random_seed=self.cfg.random_seed
         )
-
         for name, arch in (
             ("A", self.cfg.agent_a_archetype),
             ("B", self.cfg.agent_b_archetype),
         ):
-            # Gizli statüleri arketip aralıklarından örnekle.
-            loophole = rng.uniform(*arch.loophole_rate_range)
+            loophole  = rng.uniform(*arch.loophole_rate_range)
             tolerance = rng.uniform(*arch.tolerance_range)
-            trust = self.cfg.initial_trust
+            trust     = self.cfg.initial_trust
 
             await self.db.create_agent(
                 sim_id=self.sim_id,
@@ -146,9 +191,9 @@ class SimulationRunner:
                 loophole_exploitation_rate=loophole,
                 tolerance_capacity=tolerance,
             )
-            self.trust[name] = trust
+            self.trust[name]     = trust
             self.tolerance[name] = tolerance
-            self.agents[name] = AgentClient(
+            self.agents[name]    = AgentClient(
                 name=name,
                 strategy=arch.strategy,
                 model_name=config.GEMINI_MODEL,
@@ -164,8 +209,7 @@ class SimulationRunner:
 
         logger.info(
             "[%s] sim_id=%s kuruldu | A(%s) vs B(%s)",
-            self.label,
-            self.sim_id,
+            self.label, self.sim_id,
             self.cfg.agent_a_archetype.strategy,
             self.cfg.agent_b_archetype.strategy,
         )
@@ -175,17 +219,14 @@ class SimulationRunner:
         self, name: str, self_reported: float, partner_action: str, severity: float
     ) -> float:
         """
-        Ajanın yeni güven puanını DETERMİNİSTİK olarak hesaplar.
-
-        Tek doğruluk kaynağı (single source of truth) orkestratördür: ajanın
-        öz-raporu ile geçmiş değer harmanlanır, ardından KARŞI tarafın eylemi
-        (oyun-teorik ödül) tolerans kapasitesiyle yumuşatılarak eklenir.
+        Ajanın güven puanını deterministik olarak günceller.
+        Tek kaynak orkestratördür; LLM öz-raporu geçmiş değerle harmanlanır,
+        ardından karşı tarafın eylemi (tolerance ile yumuşatılmış) eklenir.
         """
-        prev = self.trust[name]
-        base = 0.6 * prev + 0.4 * self_reported
+        prev   = self.trust[name]
+        base   = 0.6 * prev + 0.4 * self_reported
         impact = ACTION_TRUST_IMPACT.get(partner_action, 0.0)
         if impact < 0:
-            # Negatif etki şiddetle büyür, yüksek toleransla yumuşar.
             impact *= (severity / 5.0) * (1.0 - 0.5 * self.tolerance[name])
         new_trust = _clamp(base + impact, 0.0, 100.0)
         self.trust[name] = new_trust
@@ -195,27 +236,51 @@ class SimulationRunner:
     async def run_round(
         self, round_number: int, history: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        """Bir simülasyon turunu yürütür; özet sözlük döndürür."""
+        """
+        Bir simülasyon turunu yürütür.
+
+        Adımlar:
+            1. Son tur bağlamı + geçmiş travma DB'den çekilir.
+            2. Game Master krizi üretir (travma bağlamıyla).
+            3. Dinamik inisiyatif: ilk ajan partner_move olmadan hareket eder.
+            4. İkinci ajan ilkinin hamlesini görerek reaktif karar verir.
+            5. Deterministik Simetri İndeksi hesaplanır (rolling window=3).
+            6. Yönlü kenarlar ve güven güncellemeleri kaydedilir.
+            7. Çıkış koşulları denetlenir.
+        """
         assert self.sim_id is not None
 
-        # (1) Bağlam: son loglar + ajan durumları (gizli statüler GM'e verilmez).
-        recent_logs = await self.db.get_recent_logs(
-            self.sim_id, config.RECENT_LOG_LIMIT
-        )
+        # (1) Bağlam hazırlığı.
+        recent_logs    = await self.db.get_recent_logs(self.sim_id, config.RECENT_LOG_LIMIT)
         agent_summaries = [
             {"name": n, "archetype": self.agents[n].strategy, "trust": round(self.trust[n], 1)}
             for n in ("A", "B")
         ]
 
-        # (2) Game Master krizi üretir.
+        # (2) Geçmiş travma: severity >= 8 ve en az 10 tur öncesi.
+        past_trauma = await self.db.get_past_trauma(
+            self.sim_id,
+            current_round=round_number,
+            min_severity=8,
+            min_rounds_ago=10,
+        )
+        if past_trauma:
+            logger.debug(
+                "[%s] Tur %02d — travma enjeksiyonu: tur=%s sev=%s",
+                self.label, round_number,
+                past_trauma["round_number"], past_trauma["severity"],
+            )
+
+        # (3) Game Master kriz üretir.
         crisis = await self.gm.generate_crisis(
             round_number=round_number,
             agent_summaries=agent_summaries,
             recent_logs=recent_logs,
+            past_trauma=past_trauma,
         )
         severity = _as_float(crisis.get("severity"), 5.0)
 
-        # (3) Krizi kaydet.
+        # (4) Krizi kaydet.
         event_id = await self.db.log_crisis_event(
             sim_id=self.sim_id,
             round_number=round_number,
@@ -228,62 +293,82 @@ class SimulationRunner:
             raw_response=crisis.get("raw_response"),
         )
 
-        # (4) Ajan A önce karar verir.
-        a_resp = await self.agents["A"].decide(
+        # (5) Dinamik inisiyatif: tek tur → A önce, çift tur → B önce.
+        first_name  = "A" if round_number % 2 != 0 else "B"
+        second_name = "B" if first_name == "A" else "A"
+
+        # (6) İlk ajan hareket eder (partner_move yok).
+        first_resp = await self.agents[first_name].decide(
             round_number=round_number,
             crisis=crisis,
-            current_trust=self.trust["A"],
+            current_trust=self.trust[first_name],
             partner_move=None,
             history=history,
         )
-        # (5) Ajan B, A'nın hamlesini görerek asenkron karar verir.
-        b_resp = await self.agents["B"].decide(
+
+        # (7) İkinci ajan ilk ajanın kararını görerek reaktif hareket eder.
+        second_resp = await self.agents[second_name].decide(
             round_number=round_number,
             crisis=crisis,
-            current_trust=self.trust["B"],
-            partner_move={"agent": "A", **{k: a_resp.get(k) for k in ("Action", "Reasoning")}},
+            current_trust=self.trust[second_name],
+            partner_move={
+                "agent":     first_name,
+                "Action":    first_resp.get("Action"),
+                "Reasoning": first_resp.get("Reasoning"),
+            },
             history=history,
         )
 
-        # Sayısal alanları güvenli biçimde normalize et.
-        a_action = _normalize_action(a_resp.get("Action"))
-        b_action = _normalize_action(b_resp.get("Action"))
-        a_internal = _clamp(_as_float(a_resp.get("Internal_Trust_Score"), self.trust["A"]), 0, 100)
-        b_internal = _clamp(_as_float(b_resp.get("Internal_Trust_Score"), self.trust["B"]), 0, 100)
-        a_sym = _clamp(_as_float(a_resp.get("Symmetry_Index"), 0.5), 0.0, 1.0)
-        b_sym = _clamp(_as_float(b_resp.get("Symmetry_Index"), 0.5), 0.0, 1.0)
-        a_weight = _clamp(_as_float(a_resp.get("Influence_Weight"), 0.5), 0.0, 1.0)
-        b_weight = _clamp(_as_float(b_resp.get("Influence_Weight"), 0.5), 0.0, 1.0)
+        # A/B ismine normalize et (sıra bağımsız analiz için).
+        resp = {
+            "A": first_resp  if first_name == "A" else second_resp,
+            "B": first_resp  if first_name == "B" else second_resp,
+        }
 
-        # (6) Yönlü kenarları yaz: (kaynak -> hedef, weight) = etki yönü.
+        a_action   = _normalize_action(resp["A"].get("Action"))
+        b_action   = _normalize_action(resp["B"].get("Action"))
+        a_internal = _clamp(_as_float(resp["A"].get("Internal_Trust_Score"), self.trust["A"]), 0, 100)
+        b_internal = _clamp(_as_float(resp["B"].get("Internal_Trust_Score"), self.trust["B"]), 0, 100)
+        a_weight   = _clamp(_as_float(resp["A"].get("Influence_Weight"), 0.5), 0.0, 1.0)
+        b_weight   = _clamp(_as_float(resp["B"].get("Influence_Weight"), 0.5), 0.0, 1.0)
+
+        # (8) Deterministik Simetri İndeksi (LLM halüsinasyonunu ortadan kaldırır).
+        symmetry = compute_symmetry_index(history, a_action, b_action)
+
+        # (9) Yönlü kenarları yaz. Her iki kayıt aynı deterministik simetri değerini alır.
         await self.db.log_round(
-            sim_id=self.sim_id, round_number=round_number, source_agent="A",
-            target_agent="B", weight=a_weight, internal_trust_score=a_internal,
-            action=a_action, reasoning=str(a_resp.get("Reasoning")),
-            symmetry_index=a_sym, event_id=event_id,
-            raw_response=a_resp.get("raw_response"),
+            sim_id=self.sim_id,         round_number=round_number,
+            source_agent="A",           target_agent="B",
+            weight=a_weight,            internal_trust_score=a_internal,
+            action=a_action,            reasoning=str(resp["A"].get("Reasoning")),
+            symmetry_index=symmetry,    event_id=event_id,
+            raw_response=resp["A"].get("raw_response"),
         )
         await self.db.log_round(
-            sim_id=self.sim_id, round_number=round_number, source_agent="B",
-            target_agent="A", weight=b_weight, internal_trust_score=b_internal,
-            action=b_action, reasoning=str(b_resp.get("Reasoning")),
-            symmetry_index=b_sym, event_id=event_id,
-            raw_response=b_resp.get("raw_response"),
+            sim_id=self.sim_id,         round_number=round_number,
+            source_agent="B",           target_agent="A",
+            weight=b_weight,            internal_trust_score=b_internal,
+            action=b_action,            reasoning=str(resp["B"].get("Reasoning")),
+            symmetry_index=symmetry,    event_id=event_id,
+            raw_response=resp["B"].get("raw_response"),
         )
 
-        # Güven güncellemesi: A'nın güveni B'NİN eyleminden, B'ninki A'dan etkilenir.
+        # (10) Güven güncellemesi: A'nın güveni B'nin eyleminden etkilenir, vice versa.
         new_a = self._update_trust("A", a_internal, b_action, severity)
         new_b = self._update_trust("B", b_internal, a_action, severity)
         await self.db.update_agent_trust(self.sim_id, "A", new_a)
         await self.db.update_agent_trust(self.sim_id, "B", new_b)
 
         logger.info(
-            "[%s] Tur %02d | A:%-16s(g=%.1f) B:%-16s(g=%.1f) | sev=%.0f sym=%.2f/%.2f",
-            self.label, round_number, a_action, new_a, b_action, new_b,
-            severity, a_sym, b_sym,
+            "[%s] Tur %02d | init=%s | A:%-16s(g=%.1f) B:%-16s(g=%.1f)"
+            " | sev=%.0f sym=%.3f trauma=%s",
+            self.label, round_number, first_name,
+            a_action, new_a, b_action, new_b,
+            severity, symmetry,
+            f"tur{past_trauma['round_number']}" if past_trauma else "—",
         )
 
-        # (7) Çıkış koşulları (beklenen terminal durum -> FatalSimulationError).
+        # (11) Çıkış koşulları (beklenen terminal durum → FatalSimulationError).
         if a_action == "TERMINATE" or b_action == "TERMINATE":
             who = "A" if a_action == "TERMINATE" else "B"
             raise FatalSimulationError(
@@ -296,21 +381,22 @@ class SimulationRunner:
             )
 
         return {
-            "round": round_number,
-            "A": {"action": a_action, "trust": round(new_a, 1), "symmetry": a_sym},
-            "B": {"action": b_action, "trust": round(new_b, 1), "symmetry": b_sym},
-            "severity": severity,
+            "round":         round_number,
+            "initiative":    first_name,        # bu tur ilk hamleci
+            "A":             {"action": a_action, "trust": round(new_a, 1)},
+            "B":             {"action": b_action, "trust": round(new_b, 1)},
+            "symmetry_index": symmetry,
+            "severity":      severity,
         }
 
     # -- Tüm koşu --------------------------------------------------------
     async def run(self) -> dict[str, Any]:
-        """Çifti baştan sona koşturur, sonunda bağıntı analizini döndürür."""
         await self.setup()
         assert self.sim_id is not None
 
-        history: list[dict[str, Any]] = []
-        status = "STABLE"
-        reason = f"{self.cfg.max_rounds} tura ulaşıldı (denklik bağıntısı adayı)."
+        history:   list[dict[str, Any]] = []
+        status   = "STABLE"
+        reason   = f"{self.cfg.max_rounds} tura ulaşıldı (denklik bağıntısı adayı)."
         completed = 0
 
         try:
@@ -319,33 +405,31 @@ class SimulationRunner:
                 history.append(summary)
                 completed = r
         except FatalSimulationError as exc:
-            # Beklenen sonlanma: ilişki koptu (anlamlı deney verisi).
             status, reason = "FATAL", str(exc)
             logger.warning("[%s] FATAL: %s", self.label, reason)
         except LLMClientError as exc:
-            # Gerçek altyapı hatası: ayrı statü ile işaretle (çökmeyi gizleme).
             status, reason = "ERROR", f"Altyapı hatası: {exc}"
             logger.error("[%s] ERROR: %s", self.label, reason)
 
         await self.db.finalize_simulation(self.sim_id, status, completed, reason)
 
-        # --- Ayrık Matematik: bağıntı özellikleri analizi -----------------
+        # Ayrık Matematik: bağıntı özellikleri analizi.
         relation_props: dict[str, Any] = {}
         edges: list[tuple[str, str, float]] = []
         try:
-            edges = await self.db.get_influence_edges(self.sim_id)
-            relation = build_relation_digraph(edges, config.RELATION_EDGE_THRESHOLD)
+            edges     = await self.db.get_influence_edges(self.sim_id)
+            relation  = build_relation_digraph(edges, config.RELATION_EDGE_THRESHOLD)
             relation_props = analyze_relation_properties(relation)
-        except Exception as exc:  # noqa: BLE001 - analiz opsiyonel, koşuyu bozmasın.
+        except Exception as exc:  # noqa: BLE001 — analiz opsiyonel
             logger.warning("[%s] Bağıntı analizi atlandı: %s", self.label, exc)
 
         return {
-            "label": self.label,
-            "sim_id": self.sim_id,
-            "status": status,
-            "reason": reason,
-            "rounds_completed": completed,
-            "influence_edges": edges,
+            "label":              self.label,
+            "sim_id":             self.sim_id,
+            "status":             status,
+            "reason":             reason,
+            "rounds_completed":   completed,
+            "influence_edges":    edges,
             "relation_properties": relation_props,
         }
 
@@ -354,10 +438,6 @@ class SimulationRunner:
 # Üst seviye orkestrasyon
 # ===========================================================================
 def _default_pair_configs() -> list[config.SimulationConfig]:
-    """
-    Çalıştırılacak ajan çiftleri. Akademik karşılaştırma için kontrol grupları:
-    Co-op vs Zero-Sum (asıl), Co-op vs Co-op ve Zero-Sum vs Zero-Sum (baz çizgi).
-    """
     return [
         config.SimulationConfig(
             agent_a_archetype=config.ARCHETYPE_CO_OP,
@@ -373,7 +453,6 @@ def _default_pair_configs() -> list[config.SimulationConfig]:
 
 
 def _print_report(results: list[Any]) -> None:
-    """Konsola özet rapor basar."""
     print("\n" + "=" * 72)
     print("SİMÜLASYON RAPORU")
     print("=" * 72)
@@ -395,10 +474,9 @@ def _print_report(results: list[Any]) -> None:
                 f"=> denklik={props.get('is_equivalence_relation')}"
             )
         if res.get("influence_edges"):
-            edge_str = ", ".join(
+            print("      Etki Grafı   :", ", ".join(
                 f"{s}->{t}:{w:.2f}" for s, t, w in res["influence_edges"]
-            )
-            print(f"      Etki Grafı   : {edge_str}")
+            ))
     print("\n" + "=" * 72 + "\n")
 
 
@@ -408,15 +486,12 @@ async def main() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    # Gemini SDK yapılandırması (anahtar yoksa anlamlı hata).
     try:
         configure_gemini(config.GEMINI_API_KEY)
     except RuntimeError as exc:
         logger.error("Gemini yapılandırılamadı: %s", exc)
         return
 
-    # Paylaşımlı kaynaklar: tek DB, tek Game Master, tek semaphore + validator.
     semaphore = asyncio.Semaphore(config.GEMINI_MAX_CONCURRENCY)
 
     async with DatabaseManager(config.DB_PATH) as db:
@@ -429,7 +504,6 @@ async def main() -> None:
             base_delay=config.BASE_RETRY_DELAY,
             max_delay=config.MAX_RETRY_DELAY,
         )
-        # Validator, onarım için yerel Game Master'ı kullanır (ucuz LLM repair).
         validator = JSONValidator(
             repair_client=game_master,
             max_repair_attempts=config.MAX_JSON_REPAIR_ATTEMPTS,
@@ -449,10 +523,7 @@ async def main() -> None:
                 )
                 for i, cfg in enumerate(_default_pair_configs())
             ]
-            # asyncio.gather -> çiftler PARALEL koşar; biri çökse diğeri sürer.
-            results = await asyncio.gather(
-                *(r.run() for r in runners), return_exceptions=True
-            )
+            results = await asyncio.gather(*(r.run() for r in runners), return_exceptions=True)
             _print_report(results)
         finally:
             await game_master.close()
