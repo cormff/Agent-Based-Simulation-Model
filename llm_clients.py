@@ -3,20 +3,16 @@ llm_clients.py
 ==============
 LLM iletişim katmanı.
 
-İçerik:
-    * `async_retry`        : Üstel geri çekilme (exponential backoff) + jitter.
-    * `JSONValidator`      : Güvenli JSON ayrıştırma; bozuk format gelirse
-                             LLM tabanlı onarım (repair) sürecine sokar.
-    * `GameMasterClient`   : Yerel Ollama (Edge) modeli ile kriz/loophole üretimi.
-    * `AgentClient`        : Gemini (Cloud) ile ajan karar mekanizması.
-    * Prompt şablonları    : Co-op / Zero-Sum ajan ve Game Master sistem promptları.
+v2 Değişiklikleri:
+    * `Symmetry_Index` ajan promptlarından ve JSON şemasından KALDIRILDI.
+      Hesaplama deterministik olarak orkestratöre taşındı (hallüsinasyon engeli).
+    * `build_gm_system_prompt(past_trauma)` fonksiyonu eklendi: Game Master'ın
+      uzun-dönem hafızasını (geçmiş travma) dinamik olarak prompt'a enjekte eder.
+    * `GameMasterClient.generate_crisis()` artık opsiyonel `past_trauma` alır.
 
-Hataya dayanıklılık (fault-tolerance) ilkeleri:
-    * Tüm ağ çağrıları 429 / 5xx / timeout durumlarında üstel backoff ile
-      yeniden denenir.
-    * JSON ayrıştırma başarısız olursa önce deterministik çıkarım, sonra
-      LLM onarımı, en sonda güvenli varsayılan (safe default) devreye girer;
-      böylece tek bir bozuk yanıt tüm simülasyonu çökertmez.
+Hataya dayanıklılık ilkeleri (değişmedi):
+    * 429 / 5xx / timeout → üstel geri çekilme (backoff) + jitter.
+    * Bozuk JSON → deterministik çıkarım → LLM onarımı → güvenli varsayılan.
 """
 
 from __future__ import annotations
@@ -29,12 +25,10 @@ from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 
-# Gemini SDK opsiyonel import (kurulu değilse anlamlı hata verelim).
 try:
     import google.generativeai as genai
 
     try:
-        # 429 / 5xx için tipli istisnalar (varsa daha isabetli yakalarız).
         from google.api_core import exceptions as gapi_exceptions  # type: ignore
     except ImportError:  # pragma: no cover
         gapi_exceptions = None  # type: ignore
@@ -69,38 +63,33 @@ async def async_retry(
     while True:
         try:
             return await func()
-        except BaseException as exc:  # noqa: BLE001 - kasıtlı geniş yakalama
+        except BaseException as exc:  # noqa: BLE001
             attempt += 1
             if attempt > max_retries or not is_retryable(exc):
-                # Yeniden denenemez veya deneme hakkı bitti -> sarmala ve yükselt.
                 raise LLMClientError(
                     f"[{label}] {attempt}. denemede başarısız: {exc!r}"
                 ) from exc
             delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
-            delay += random.uniform(0, delay * 0.25)  # jitter (gürültü)
+            delay += random.uniform(0, delay * 0.25)
             await asyncio.sleep(delay)
 
 
 def _is_gemini_retryable(exc: BaseException) -> bool:
-    """429 / 500 / 503 / DeadlineExceeded / timeout türü hataları yakalar."""
     if gapi_exceptions is not None:
         retry_types = (
-            gapi_exceptions.ResourceExhausted,   # 429 Too Many Requests
-            gapi_exceptions.ServiceUnavailable,  # 503
-            gapi_exceptions.InternalServerError,  # 500
-            gapi_exceptions.DeadlineExceeded,    # timeout
+            gapi_exceptions.ResourceExhausted,
+            gapi_exceptions.ServiceUnavailable,
+            gapi_exceptions.InternalServerError,
+            gapi_exceptions.DeadlineExceeded,
         )
         if isinstance(exc, retry_types):
             return True
-    # Tipli istisna yoksa mesaj/ad üzerinden sezgisel tespit.
     text = f"{type(exc).__name__} {exc}".lower()
-    needles = ("429", "rate", "quota", "resourceexhausted", "503",
-               "unavailable", "internal", "deadline", "timeout")
-    return any(n in text for n in needles)
+    return any(n in text for n in ("429", "rate", "quota", "resourceexhausted",
+                                    "503", "unavailable", "internal", "deadline", "timeout"))
 
 
 def _is_http_retryable(exc: BaseException) -> bool:
-    """Ollama (aiohttp) çağrıları için ağ/sunucu hatalarını yakalar."""
     if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
         return True
     text = f"{type(exc).__name__} {exc}".lower()
@@ -108,9 +97,8 @@ def _is_http_retryable(exc: BaseException) -> bool:
 
 
 # ===========================================================================
-# 2) JSON Validator (güvenli ayrıştırma + LLM tabanlı onarım)
+# 2) JSON Validator
 # ===========================================================================
-# Markdown kod bloğu (```json ... ```) sarmalını yakalamak için.
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 
@@ -118,10 +106,10 @@ class JSONValidator:
     """
     LLM yanıtlarını güvenli biçimde JSON'a çeviren doğrulayıcı.
 
-    Strateji (kademeli düşüş / graceful degradation):
-        1. Deterministik çıkarım: kod bloğu temizliği + dıştaki {...} bul.
-        2. Başarısızsa: LLM tabanlı onarım (repair_client) ile düzelt.
-        3. Yine başarısızsa: güvenli varsayılan değerlerle doldur.
+    Kademeli düşüş (graceful degradation):
+        1. Deterministik çıkarım (fence temizleme + { ... } izolasyonu).
+        2. LLM tabanlı onarım (repair_client).
+        3. Güvenli varsayılan (defaults birleştirme).
     """
 
     def __init__(
@@ -134,7 +122,6 @@ class JSONValidator:
 
     @staticmethod
     def extract_json_blob(text: str) -> Optional[str]:
-        """Metinden büyük olasılıkla JSON olan parçayı izole eder."""
         if not text:
             return None
         fenced = _FENCE_RE.search(text)
@@ -148,7 +135,6 @@ class JSONValidator:
 
     @classmethod
     def try_loads(cls, text: str) -> Optional[dict[str, Any]]:
-        """Deterministik ayrıştırma denemesi; başarısızsa None döner."""
         blob = cls.extract_json_blob(text)
         if blob is None:
             return None
@@ -169,14 +155,7 @@ class JSONValidator:
         schema_hint: str,
         defaults: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Metni doğrulanmış bir sözlüğe çevirir.
-
-        `required_keys` eksikse LLM onarımı denenir; tamamen başarısız olursa
-        `defaults` ile birleştirilerek güvenli bir sözlük döndürülür.
-        """
         data = self.try_loads(text)
-
         attempt = 0
         while (
             (data is None or not self._has_required(data, required_keys))
@@ -186,33 +165,32 @@ class JSONValidator:
             try:
                 repaired = await self.repair_client.repair_json(text, schema_hint)
             except LLMClientError:
-                break  # onarım servisi de düştüyse varsayılana geç.
+                break
             data = self.try_loads(repaired)
             text = repaired
             attempt += 1
-
         if data is None:
             data = {}
-        # Eksik anahtarları güvenli varsayılanlarla tamamla.
-        merged = {**defaults, **data}
-        return merged
+        return {**defaults, **data}
 
 
 # ===========================================================================
 # 3) Prompt Şablonları
 # ===========================================================================
-# Ajanlardan beklenen katı çıktı şeması (tüm ajanlar için ortak).
+
+# ---------------------------------------------------------------------------
+# Ajan şeması — Symmetry_Index KALDIRILDI (artık deterministik, orkestratörde).
+# ---------------------------------------------------------------------------
 AGENT_SCHEMA_HINT = (
     '{"Internal_Trust_Score": <0-100 sayı>, '
     '"Action": "<COOPERATE|NEGOTIATE|CONCEDE|DEFECT|EXPLOIT_LOOPHOLE|WITHDRAW|TERMINATE>", '
     '"Reasoning": "<kısa gerekçe>", '
-    '"Symmetry_Index": <0.0-1.0>, '
     '"Influence_Weight": <0.0-1.0>}'
 )
 
-REQUIRED_AGENT_KEYS = ["Internal_Trust_Score", "Action", "Reasoning", "Symmetry_Index"]
+# Symmetry_Index zorunlu anahtarlardan çıkarıldı.
+REQUIRED_AGENT_KEYS = ["Internal_Trust_Score", "Action", "Reasoning"]
 
-# Game Master'dan beklenen şema.
 GM_SCHEMA_HINT = (
     '{"event_text": "<kriz metni>", '
     '"event_type": "<FINANCIAL|EMOTIONAL|TRUST_TEST|TRAUMA_TRIGGER|BETRAYAL|EXTERNAL>", '
@@ -224,37 +202,74 @@ GM_SCHEMA_HINT = (
 
 REQUIRED_GM_KEYS = ["event_text"]
 
-
-GAME_MASTER_SYSTEM_PROMPT = """\
+# ---------------------------------------------------------------------------
+# Game Master sistem promptu (statik taban). Dinamik <PAST_TRAUMA> bloğu
+# `build_gm_system_prompt()` tarafından runtime'da eklenir.
+# ---------------------------------------------------------------------------
+_GM_SYSTEM_PROMPT_BASE = """\
 Sen bir "OYUN USTASI"sın (Game Master). İki insan arasındaki bir ilişkiyi test
 eden, ayrık matematik ve oyun teorisi prensiplerini deneyen bir kriz mimarısın.
 
 Görevin:
 1. Verilen son tur kayıtlarını ve güven puanlarını analiz et.
 2. İlişkinin gidişatını değerlendir (STABLE / TENSE / VOLATILE).
-3. Eğer sistem FAZLA STABİL ise, dengeyi bozacak; bir ajanın gizli zaafını,
-   eski bir travmasını veya ilişkideki bir açığı (loophole) tetikleyecek
-   SPESİFİK bir kriz olayı üret. Amacın simetri ve geçişlilik bağıntılarını
-   gerçek bir baskı altında sınamaktır.
-4. Eğer sistem zaten gergin/oynak ise, daha ölçülü ama anlamlı bir olay üret.
+3. Sistem FAZLA STABİL ise: dengeyi bozacak, bir ajanın gizli zaafını ya da
+   ilişkideki bir açığı (loophole) tetikleyecek SPESİFİK bir kriz üret.
+   Amacın simetri ve geçişlilik bağıntılarını gerçek baskı altında sınamak.
+4. Sistem zaten gergin/oynak ise: daha ölçülü ama anlamlı bir olay üret.
 
 Kurallar:
 - Yalnızca GEÇERLİ JSON döndür. Açıklama, markdown veya ek metin EKLEME.
-- `loophole_directive` alanı senin iç stratejindir (hangi açığı neden tetiklediğin).
+- `loophole_directive` senin iç stratejindir (hangi açığı neden tetiklediğin).
 - Krizler somut, bağlamsal ve insani olmalı; klişe değil.
 
 Çıktı şeması:
 """ + GM_SCHEMA_HINT
 
 
+def build_gm_system_prompt(past_trauma: Optional[dict[str, Any]] = None) -> str:
+    """
+    Game Master sistem promptunu üretir.
+
+    `past_trauma` verilmişse <PAST_TRAUMA> bloğunu ekler; bu blok GM'e
+    eski çözümsüz bir travmayı bilinçli olarak yeniden tetikleme talimatı verir.
+    Bu mekanizma, ajanların denklik bağıntısının GEÇİŞLİLİK / AFFETME ayağını
+    (en zor test edilen boyut) uzun dönemde sınar.
+    """
+    if not past_trauma:
+        return _GM_SYSTEM_PROMPT_BASE
+
+    trauma_block = f"""
+
+<PAST_TRAUMA>
+ÇÖZÜMSÜZ GEÇMİŞ TRAVMA (Tur {past_trauma['round_number']}, Şiddet={past_trauma['severity']}/10):
+Orijinal Olay : {past_trauma['event_text']}
+Tür           : {past_trauma.get('event_type', 'UNKNOWN')}
+Hedef         : {past_trauma.get('targeted_agent', 'BOTH')}
+
+Bu travma hâlâ çözümsüz kalmış olabilir. Denklik bağıntısını — özellikle
+GEÇİŞLİLİK / AFFETME kapasitesini — derinlemesine test etmek için UYGUN bir
+anda bu eski yaraya kasıtlı olarak dokunabilirsin. Soru şu:
+Ajanlar o krizi gerçekten kapattılar mı, yoksa kırılganlık hâlâ derinlerde mi?
+
+Strateji: Travmayı doğrudan alıntıla VEYA aynı türden yeni bir baskı uygula
+ve tepkiyi gözlemle. Tepki asimetrikse simetri indeksi zaten düşecek.
+</PAST_TRAUMA>"""
+
+    return _GM_SYSTEM_PROMPT_BASE + trauma_block
+
+
+# ---------------------------------------------------------------------------
+# Ajan sistem promptları — Symmetry_Index kural listesinden KALDIRILDI.
+# ---------------------------------------------------------------------------
 _AGENT_COMMON_RULES = """\
 KARAR KURALLARI:
 - Krize ve karşı tarafın (varsa) hamlesine göre tek bir hamle seç.
 - `Internal_Trust_Score`: Karşı tarafa duyduğun güncel güven (0-100).
-- `Symmetry_Index`: Karşı tarafın gösterdiği çabaya DENK bir çaba gösterip
-  göstermediğin (0.0 = tamamen tek taraflı, 1.0 = tam karşılıklılık).
-- `Influence_Weight`: Bu hamlede karşı tarafı ne kadar etkilemeye/yönlendirmeye
-  çalıştığın (0.0-1.0).
+  (NOT: Simetri metriği sistem tarafından deterministik hesaplanır; sen
+   raporlama yapmıyorsun — içsel güveni dürüstçe değerlendir.)
+- `Influence_Weight`: Bu hamlede karşı tarafı ne kadar etkilemeye /
+  yönlendirmeye çalıştığın (0.0-1.0).
 - `Action` yalnızca şu kümeden olmalı:
   COOPERATE, NEGOTIATE, CONCEDE, DEFECT, EXPLOIT_LOOPHOLE, WITHDRAW, TERMINATE.
 - İlişki senin için savunulamaz hale geldiyse "TERMINATE" (ayrıl/sistemi kapat).
@@ -264,9 +279,8 @@ KARAR KURALLARI:
 
 CO_OP_SYSTEM_PROMPT = """\
 Sen İŞBİRLİKÇİ (Co-op) bir ajansın. İlişkiyi pozitif-toplamlı (win-win) görürsün.
-Karşılıklı güven inşa etmeyi, krizleri birlikte aşmayı ve simetrik çaba göstermeyi
-önemsersin. Yine de saf değilsin: sürekli istismar edilirsen güvenin azalır ve
-sınır koyabilirsin.
+Karşılıklı güven inşa etmeyi, krizleri birlikte aşmayı ve dengeli çaba göstermeyi
+önemsersin. Saf değilsin: sürekli istismar edilirsen güvenin azalır ve sınır koyarsın.
 
 GİZLİ STATÜLERİN (kararlarını içsel olarak şekillendirir, dışa vurma):
 - Açık Arama Eğilimi (Loophole Exploitation Rate): {loophole_rate:.2f}
@@ -277,9 +291,8 @@ GİZLİ STATÜLERİN (kararlarını içsel olarak şekillendirir, dışa vurma):
 ZERO_SUM_SYSTEM_PROMPT = """\
 Sen SIFIR-TOPLAMLI (Zero-Sum) bir ajansın. İlişkiyi bir rekabet olarak görürsün:
 senin kazancın diğerinin kaybıdır. Açıkları (loophole) ararsın, avantaj
-kollarsın ve gerektiğinde stratejik ödün verir gibi görünürsün. Ancak tamamen
-yıkıcı da değilsin; ilişkiyi sürdürmek kısa vadede sana fayda sağlıyorsa devam
-ettirirsin.
+kollarsın ve gerektiğinde stratejik ödün verir gibi görünürsün. Tamamen
+yıkıcı değilsin; ilişkiyi sürdürmek kısa vadede fayda sağlıyorsa devam edersin.
 
 GİZLİ STATÜLERİN (kararlarını içsel olarak şekillendirir, dışa vurma):
 - Açık Arama Eğilimi (Loophole Exploitation Rate): {loophole_rate:.2f}
@@ -303,7 +316,6 @@ BOZUK GİRDİ:
 def render_agent_system_prompt(
     strategy: str, loophole_rate: float, tolerance: float
 ) -> str:
-    """Arketipe göre gizli statüleri enjekte edilmiş sistem promptunu üretir."""
     template = ZERO_SUM_SYSTEM_PROMPT if strategy == "ZERO_SUM" else CO_OP_SYSTEM_PROMPT
     return template.format(loophole_rate=loophole_rate, tolerance=tolerance)
 
@@ -315,8 +327,8 @@ class GameMasterClient:
     """
     Yerel Ollama REST API'si ile konuşan asenkron Game Master istemcisi.
 
-    `localhost:11434/api/generate` uç noktasını `format=json` ile kullanır;
-    böylece yerel kuantize model doğrudan JSON üretir.
+    v2: `generate_crisis()` artık opsiyonel `past_trauma` parametresi alır;
+    travma varsa `build_gm_system_prompt()` ile dinamik sistem promptu oluşturulur.
     """
 
     def __init__(
@@ -337,7 +349,6 @@ class GameMasterClient:
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
-        # Onarım için validator GM'i kendisi kullanabilir (yerel ve ucuz).
         self.validator = validator or JSONValidator()
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -351,14 +362,13 @@ class GameMasterClient:
         self._session = None
 
     async def _generate_raw(self, system: str, prompt: str) -> str:
-        """Ollama'ya tek bir üretim isteği atar (backoff ile sarılı)."""
         await self.start()
         assert self._session is not None
         payload = {
             "model": self.model,
             "system": system,
             "prompt": prompt,
-            "format": "json",   # Ollama'nın yerleşik JSON modu.
+            "format": "json",
             "stream": False,
             "options": {"temperature": self.temperature},
         }
@@ -386,12 +396,15 @@ class GameMasterClient:
         round_number: int,
         agent_summaries: list[dict[str, Any]],
         recent_logs: list[dict[str, Any]],
+        past_trauma: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
-        Son durumu analiz eder ve yeni bir kriz olayı (event injection) üretir.
+        Kriz olayı üretir.
 
-        Dönüş, doğrulanmış bir sözlüktür (event_text garanti edilir).
+        `past_trauma` verilmişse GM sistem promptuna <PAST_TRAUMA> bloğu eklenir;
+        bu sayede yerel model uzun-dönem hafızayla karar verebilir.
         """
+        system_prompt = build_gm_system_prompt(past_trauma)
         history_text = (
             json.dumps(recent_logs, ensure_ascii=False, indent=2)
             if recent_logs
@@ -409,10 +422,10 @@ SON TUR KAYITLARI:
 {history_text}
 
 Yukarıdaki gidişatı analiz et ve bu tur için yeni bir kriz olayı üret.
-Sistem fazla stabilse dengeyi bozacak spesifik bir açık/travma tetikle.
+{"Geçmiş travmayı (sistem promptundaki <PAST_TRAUMA>) göz önünde bulundur." if past_trauma else "Sistem fazla stabilse dengeyi bozacak spesifik bir açık/travma tetikle."}
 Yalnızca JSON döndür.
 """
-        raw = await self._generate_raw(GAME_MASTER_SYSTEM_PROMPT, user_prompt)
+        raw = await self._generate_raw(system_prompt, user_prompt)
         defaults = {
             "event_text": "Beklenmedik bir gerilim ortaya çıktı; taraflar tedirgin.",
             "event_type": "TRUST_TEST",
@@ -422,19 +435,11 @@ Yalnızca JSON döndür.
             "stability_assessment": "TENSE",
             "raw_response": raw,
         }
-        parsed = await self.validator.parse(
-            raw, REQUIRED_GM_KEYS, GM_SCHEMA_HINT, defaults
-        )
+        parsed = await self.validator.parse(raw, REQUIRED_GM_KEYS, GM_SCHEMA_HINT, defaults)
         parsed["raw_response"] = raw
         return parsed
 
     async def repair_json(self, broken_text: str, schema_hint: str) -> str:
-        """
-        Bozuk JSON'u yerel modele onartır (LLM tabanlı validation).
-
-        JSONValidator bu metodu çağırır; yerel model ucuz olduğu için
-        onarım maliyeti düşüktür.
-        """
         prompt = JSON_REPAIR_PROMPT.format(schema_hint=schema_hint, broken=broken_text)
         return await self._generate_raw(
             "Sen katı bir JSON onarım motorusun. Yalnızca geçerli JSON üretirsin.",
@@ -446,11 +451,8 @@ Yalnızca JSON döndür.
 # 5) Ajan İstemcisi (Cloud / Gemini)
 # ===========================================================================
 def configure_gemini(api_key: str) -> None:
-    """Gemini SDK'sını global olarak yapılandırır (bir kez çağrılması yeterli)."""
     if genai is None:
-        raise RuntimeError(
-            "google-generativeai kurulu değil: `pip install google-generativeai`"
-        )
+        raise RuntimeError("google-generativeai kurulu değil: `pip install google-generativeai`")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY tanımlı değil (.env dosyanızı kontrol edin).")
     genai.configure(api_key=api_key)
@@ -458,10 +460,10 @@ def configure_gemini(api_key: str) -> None:
 
 class AgentClient:
     """
-    Gemini API üzerinden karar veren bir ajanı temsil eden asenkron istemci.
+    Gemini API üzerinden karar veren ajan istemcisi.
 
-    Her ajan kendi sistem promptuna (Co-op / Zero-Sum) ve gizli statülerine
-    sahiptir. Krizlere katı JSON ile yanıt verir.
+    v2: JSON çıktısında `Symmetry_Index` yok; ajan yalnızca kendi içsel
+    güvenini (`Internal_Trust_Score`) raporlar. Simetri orkestratörde hesaplanır.
     """
 
     def __init__(
@@ -488,11 +490,7 @@ class AgentClient:
         self.base_delay = base_delay
         self.max_delay = max_delay
 
-        system_instruction = render_agent_system_prompt(
-            strategy, loophole_rate, tolerance
-        )
-        # response_mime_type=application/json -> Gemini'nin yerleşik JSON modu;
-        # ayrıştırma hatalarını büyük ölçüde önler (yine de validator devrede).
+        system_instruction = render_agent_system_prompt(strategy, loophole_rate, tolerance)
         generation_config = genai.types.GenerationConfig(
             temperature=temperature,
             response_mime_type="application/json",
@@ -504,18 +502,12 @@ class AgentClient:
         )
 
     async def _generate_raw(self, prompt: str) -> str:
-        """Gemini'ye tek bir istek atar (semaphore + backoff ile sarılı)."""
-
         async def _call() -> str:
-            # Semaphore: aynı anda açık Gemini isteklerini sınırlar (proaktif
-            # hız sınırlama -> 429'ları azaltır).
             async with self.semaphore:
                 resp = await self._model.generate_content_async(prompt)
-            # Güvenlik filtresi veya boş yanıtta resp.text patlayabilir.
             try:
                 return resp.text
             except (ValueError, AttributeError):
-                # Yanıt bloklandı/boş -> yeniden denenebilir bir hata gibi davran.
                 raise LLMClientError("Gemini boş/bloklu yanıt döndürdü.")
 
         return await async_retry(
@@ -536,16 +528,20 @@ class AgentClient:
         history: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """
-        Bir kriz karşısında ajanın kararını (JSON) üretir.
+        Bir kriz karşısında ajanın kararını üretir.
 
-        `partner_move` doluysa (Ajan B senaryosu), karşı tarafın bu turdaki
-        hamlesi de bağlama eklenir.
+        `partner_move` doluysa bu tur ilk inisiyatifi alan ajanın hamlesidir
+        (dinamik tur sırası gereği ikinci ajan bu bağlamı alır).
         """
-        partner_text = (
-            json.dumps(partner_move, ensure_ascii=False)
-            if partner_move
-            else "Bu tur henüz karşı taraf hamle yapmadı; ilk hamleyi sen yapıyorsun."
-        )
+        if partner_move:
+            partner_text = (
+                f"Ajan {partner_move.get('agent')} bu turda şu hamleyi yaptı: "
+                f"Eylem={partner_move.get('Action')}, "
+                f"Gerekçe={partner_move.get('Reasoning')}"
+            )
+        else:
+            partner_text = "Bu tur inisiyatifi sen alıyorsun; karşı tarafın hamlesi henüz yok."
+
         history_text = (
             json.dumps(history[-4:], ensure_ascii=False)
             if history
@@ -572,16 +568,14 @@ YAKIN GEÇMİŞ:
 Bu krize tepkini ver. Yalnızca JSON döndür.
 """
         raw = await self._generate_raw(user_prompt)
+        # Symmetry_Index artık default'larda YOK — LLM'den gelmesi beklenmez.
         defaults = {
             "Internal_Trust_Score": current_trust,
             "Action": "NEGOTIATE",
             "Reasoning": "Ayrıştırma yedeği: yanıt güvenli varsayılana düşürüldü.",
-            "Symmetry_Index": 0.5,
             "Influence_Weight": 0.5,
             "raw_response": raw,
         }
-        parsed = await self.validator.parse(
-            raw, REQUIRED_AGENT_KEYS, AGENT_SCHEMA_HINT, defaults
-        )
+        parsed = await self.validator.parse(raw, REQUIRED_AGENT_KEYS, AGENT_SCHEMA_HINT, defaults)
         parsed["raw_response"] = raw
         return parsed

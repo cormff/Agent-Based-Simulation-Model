@@ -346,6 +346,37 @@ class DatabaseManager:
         row = await cur.fetchone()
         return dict(row) if row else None
 
+    async def get_past_trauma(
+        self,
+        sim_id: int,
+        current_round: int,
+        min_severity: int = 8,
+        min_rounds_ago: int = 10,
+    ) -> Optional[dict[str, Any]]:
+        """
+        Game Master uzun-dönem hafızası için geçmiş travmayı sorgular.
+
+        Kriter:
+            - severity >= min_severity  (yüksek şiddetli kriz)
+            - round_number <= current_round - min_rounds_ago  (en az 10 tur önce)
+            - En yüksek şiddetli, ardından en eski (round_number ASC) seçilir.
+
+        Dönüş None ise travma yok (ya da henüz yeterli tur geçmedi);
+        orkestratör bu durumda GM'ye travma bağlamı göndermez.
+        """
+        assert self._conn is not None
+        cutoff_round = current_round - min_rounds_ago
+        if cutoff_round <= 0:
+            return None
+        cur = await self._conn.execute(
+            "SELECT * FROM Crisis_Events "
+            "WHERE sim_id = ? AND severity >= ? AND round_number <= ? "
+            "ORDER BY severity DESC, round_number ASC LIMIT 1",
+            (sim_id, min_severity, cutoff_round),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
     # -- NetworkX / Ayrık Matematik analizi -------------------------------
     async def get_influence_edges(
         self, sim_id: int
