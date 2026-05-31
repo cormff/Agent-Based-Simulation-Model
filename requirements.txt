@@ -1,0 +1,14 @@
+# Cloud ajan karar mekanizması (Gemini API)
+google-generativeai>=0.7.0
+
+# Yerel Game Master (Ollama REST API) ve genel asenkron HTTP istekleri
+aiohttp>=3.9.0
+
+# Asenkron SQLite erişimi (event loop'u bloklamadan veri yazma/okuma)
+aiosqlite>=0.20.0
+
+# Ayrık Matematik ispatları için yönlü graf (DiGraph) analizi
+networkx>=3.2
+
+# .env üzerinden API anahtarı / yapılandırma yönetimi
+python-dotenv>=1.0.0
