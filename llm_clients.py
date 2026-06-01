@@ -188,6 +188,10 @@ AGENT_SCHEMA_HINT = (
     '"Influence_Weight": <0.0-1.0>}'
 )
 
+# str.format() şablonlarında kullanmak için JSON { } karakterleri çiftlendi.
+# AGENT_SCHEMA_HINT doğrudan validator'a verilirken bu versiyon prompt template'e gömülür.
+_AGENT_SCHEMA_HINT_ESCAPED = AGENT_SCHEMA_HINT.replace("{", "{{").replace("}", "}}")
+
 # Symmetry_Index zorunlu anahtarlardan çıkarıldı.
 REQUIRED_AGENT_KEYS = ["Internal_Trust_Score", "Action", "Reasoning"]
 
@@ -275,7 +279,7 @@ KARAR KURALLARI:
 - İlişki senin için savunulamaz hale geldiyse "TERMINATE" (ayrıl/sistemi kapat).
 
 ÇIKTI: Yalnızca GEÇERLİ JSON döndür, başka HİÇBİR metin ekleme. Şema:
-""" + AGENT_SCHEMA_HINT
+""" + _AGENT_SCHEMA_HINT_ESCAPED
 
 CO_OP_SYSTEM_PROMPT = """\
 Sen İŞBİRLİKÇİ (Co-op) bir ajansın. İlişkiyi pozitif-toplamlı (win-win) görürsün.
