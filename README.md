@@ -50,6 +50,32 @@ halinde `asyncio.gather` ile koşturulur; `GEMINI_MAX_CONCURRENCY` semaphore'u
 ek bir hız sınırı katmanı sağlar. Sonuç `simulation.db` içine yazılır ve konsola
 istatistiksel özet (STABLE/FATAL dağılımı, bağıntı özellikleri) raporlanır.
 
+### Tek İlişki İzleme / Debug Modu (`--single`)
+
+Veri fabrikasını başlatmadan önce **tek bir ilişkiyi** canlı izleyip parametre
+ayarı yapmak için `--single` modunu kullanın. Her tur sonunda kriz metni, her iki
+ajanın gerekçesi, güven değişimi (eski → yeni, delta), biriken teknik borç ve
+simetri indeksi okunabilir biçimde basılır:
+
+```bash
+# Tek Co-op × Zero-Sum ilişkisini otomatik izle
+python main_orchestrator.py --single
+
+# Adım-adım: her tur sonunda dur (Enter=sonraki · c=sona kadar · q=durdur)
+python main_orchestrator.py --single --step
+
+# Farklı çift / tur / tohum + AYRI debug DB (üretim verisini kirletmez)
+python main_orchestrator.py --single --pair co_op co_op --rounds 12 --seed 7 --db debug.db
+
+# Travma enjeksiyonu gibi ayrıntılar için DEBUG loglama
+python main_orchestrator.py --single --verbose
+```
+
+> İpucu: `--db debug.db` ile test koşularını `simulation.db`'den ayrı tutun;
+> batch veri setiniz temiz kalır. Gözlemci (observer) çıkış koşullarından **önce**
+> çağrıldığı için, FATAL'ı (Buffer Overflow / TERMINATE) tetikleyen turu da
+> canlı görebilirsiniz. Batch modu (`--single` olmadan) hiç etkilenmez.
+
 ### Veri Analizi ve Görselleştirme (V3)
 
 Batch koşusu bittikten sonra grafikleri üretmek için:
