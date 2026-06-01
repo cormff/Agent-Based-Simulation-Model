@@ -79,6 +79,30 @@ STABILITY_ROUND_TARGET: int = MAX_ROUNDS
 RELATION_EDGE_THRESHOLD: float = float(os.getenv("ABM_RELATION_EDGE_THRESHOLD", "0.5"))
 
 
+# ---------------------------------------------------------------------------
+# Teknik Borç (Technical Debt) — V3
+# ---------------------------------------------------------------------------
+# Sosyolojik "bastırılmış duygu / çözülmemiş gerilim" metriği.
+# Bir ajan CONCEDE/WITHDRAW ile taviz verir ama güveni yine de düşerse
+# (içine sindiremediği taviz), kaybedilen güven kadar puan teknik borca eklenir.
+# Bu borç aşağıdaki limiti (Tolerance Capacity tamponu) aşarsa ajan, biriken
+# gerilimi boşaltarak TERMINATE kararı verir (Buffer Overflow / patlama).
+TECHNICAL_DEBT_LIMIT: float = float(os.getenv("ABM_TECHNICAL_DEBT_LIMIT", "30.0"))
+
+
+# ---------------------------------------------------------------------------
+# İstatistiksel Yığın Çalıştırma (Batch Execution) — V3
+# ---------------------------------------------------------------------------
+# Her bir arketip eşleşmesinden (örn. "Co-op vs Zero-Sum", "Co-op vs Co-op")
+# kaç adet bağımsız simülasyon koşturulacağı. İstatistiksel anlamlılık için
+# aynı yapılandırma çok sayıda tekrarlanır (akademik veri fabrikası).
+BATCH_SIZE: int = int(os.getenv("ABM_BATCH_SIZE", "50"))
+# asyncio.gather'ı tek seferde değil "chunk"lar halinde çalıştırırken her bir
+# paketteki eşzamanlı simülasyon (runner) sayısı. API kilitlenmelerini ve
+# Ollama/Gemini üzerindeki ani yükü önler (Semaphore limitlerine ek katman).
+CHUNK_SIZE: int = int(os.getenv("ABM_CHUNK_SIZE", "10"))
+
+
 @dataclass
 class AgentArchetype:
     """Bir ajan kişiliğinin (oyun-teorik duruşunun) şablonu."""

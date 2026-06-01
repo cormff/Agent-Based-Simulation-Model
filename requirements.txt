@@ -12,3 +12,9 @@ networkx>=3.2
 
 # .env üzerinden API anahtarı / yapılandırma yönetimi
 python-dotenv>=1.0.0
+
+# V3 — Veri Analiz ve Görselleştirme (data_analyzer.py)
+pandas>=2.0.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+lifelines>=0.27.0

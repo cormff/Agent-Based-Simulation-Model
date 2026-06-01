@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 from typing import Any, Optional
 
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS Agents (
     -- Gizli statüler (ajan promptlarına enjekte edilir, dışarıdan görünmez):
     loophole_exploitation_rate  REAL    NOT NULL,
     tolerance_capacity          REAL    NOT NULL,
+    -- V3: birikmiş "bastırılmış gerilim" (çözülmemiş taviz) toplamı.
+    technical_debt              REAL    NOT NULL DEFAULT 0.0,
     FOREIGN KEY (sim_id) REFERENCES Simulations(sim_id)
 );
 
@@ -92,6 +95,7 @@ CREATE TABLE IF NOT EXISTS Round_Logs (
     action                TEXT,
     reasoning             TEXT,
     symmetry_index        REAL,
+    technical_debt        REAL    DEFAULT 0.0,             -- V3: tur sonu birikmiş teknik borç
     raw_response          TEXT,
     created_at            REAL    NOT NULL,
     FOREIGN KEY (sim_id)   REFERENCES Simulations(sim_id),
@@ -128,7 +132,31 @@ class DatabaseManager:
         assert self._conn is not None, "Önce connect() çağrılmalı."
         async with self._write_lock:
             await self._conn.executescript(_SCHEMA)
+            await self._migrate_schema()
             await self._conn.commit()
+
+    async def _migrate_schema(self) -> None:
+        """
+        Geriye dönük şema göçü (idempotent).
+
+        V3 öncesi oluşturulmuş `simulation.db` dosyalarında `technical_debt`
+        sütunu bulunmaz; `CREATE TABLE IF NOT EXISTS` mevcut tabloya sütun
+        eklemez. Burada eksik sütunları `ALTER TABLE` ile ekleriz. Sütun zaten
+        varsa SQLite "duplicate column" hatası verir; bunu güvenle yutarız.
+        """
+        assert self._conn is not None
+        migrations = (
+            ("Agents", "technical_debt", "REAL NOT NULL DEFAULT 0.0"),
+            ("Round_Logs", "technical_debt", "REAL DEFAULT 0.0"),
+        )
+        for table, column, coldef in migrations:
+            try:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"
+                )
+            except sqlite3.OperationalError as exc:  # sütun zaten mevcut
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -166,14 +194,15 @@ class DatabaseManager:
         trust_score: float,
         loophole_exploitation_rate: float,
         tolerance_capacity: float,
+        technical_debt: float = 0.0,
     ) -> int:
         """Gizli statüleriyle birlikte bir ajan oluşturur, agent_id döner."""
         assert self._conn is not None
         async with self._write_lock:
             cur = await self._conn.execute(
                 "INSERT INTO Agents (sim_id, name, archetype, trust_score, "
-                "loophole_exploitation_rate, tolerance_capacity) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "loophole_exploitation_rate, tolerance_capacity, technical_debt) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     sim_id,
                     name,
@@ -181,6 +210,7 @@ class DatabaseManager:
                     trust_score,
                     loophole_exploitation_rate,
                     tolerance_capacity,
+                    technical_debt,
                 ),
             )
             await self._conn.commit()
@@ -235,20 +265,23 @@ class DatabaseManager:
         symmetry_index: Optional[float],
         event_id: Optional[int] = None,
         raw_response: Optional[str] = None,
+        technical_debt: Optional[float] = None,
     ) -> int:
         """
         Tek bir ajanın bir turdaki kararını yönlü kenar olarak kaydeder.
 
         (source_agent -> target_agent, weight) üçlüsü, ileride NetworkX
-        DiGraph'ında doğrudan kenar olarak kullanılır.
+        DiGraph'ında doğrudan kenar olarak kullanılır. `technical_debt`,
+        o tur sonunda kaynağın (source_agent) birikmiş gerilimini saklar.
         """
         assert self._conn is not None
         async with self._write_lock:
             cur = await self._conn.execute(
                 "INSERT INTO Round_Logs (sim_id, round_number, event_id, "
                 "source_agent, target_agent, weight, internal_trust_score, "
-                "action, reasoning, symmetry_index, raw_response, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "action, reasoning, symmetry_index, technical_debt, "
+                "raw_response, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     sim_id,
                     round_number,
@@ -260,6 +293,7 @@ class DatabaseManager:
                     action,
                     reasoning,
                     symmetry_index,
+                    technical_debt,
                     raw_response,
                     time.time(),
                 ),
@@ -275,6 +309,18 @@ class DatabaseManager:
             await self._conn.execute(
                 "UPDATE Agents SET trust_score = ? WHERE sim_id = ? AND name = ?",
                 (trust_score, sim_id, name),
+            )
+            await self._conn.commit()
+
+    async def update_agent_technical_debt(
+        self, sim_id: int, name: str, technical_debt: float
+    ) -> None:
+        """Bir ajanın birikmiş teknik borç puanını günceller."""
+        assert self._conn is not None
+        async with self._write_lock:
+            await self._conn.execute(
+                "UPDATE Agents SET technical_debt = ? WHERE sim_id = ? AND name = ?",
+                (technical_debt, sim_id, name),
             )
             await self._conn.commit()
 
