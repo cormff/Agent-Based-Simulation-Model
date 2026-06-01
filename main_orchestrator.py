@@ -168,6 +168,7 @@ class SimulationRunner:
         self.agents: dict[str, AgentClient] = {}
         self.trust: dict[str, float] = {}
         self.tolerance: dict[str, float] = {}
+        self.technical_debt: dict[str, float] = {}
 
     # -- Kurulum / İlklendirme -------------------------------------------
     async def setup(self) -> None:
@@ -191,9 +192,10 @@ class SimulationRunner:
                 loophole_exploitation_rate=loophole,
                 tolerance_capacity=tolerance,
             )
-            self.trust[name]     = trust
-            self.tolerance[name] = tolerance
-            self.agents[name]    = AgentClient(
+            self.trust[name]          = trust
+            self.tolerance[name]      = tolerance
+            self.technical_debt[name] = 0.0
+            self.agents[name]         = AgentClient(
                 name=name,
                 strategy=arch.strategy,
                 model_name=config.GEMINI_MODEL,
@@ -335,7 +337,25 @@ class SimulationRunner:
         # (8) Deterministik Simetri İndeksi (LLM halüsinasyonunu ortadan kaldırır).
         symmetry = compute_symmetry_index(history, a_action, b_action)
 
-        # (9) Yönlü kenarları yaz. Her iki kayıt aynı deterministik simetri değerini alır.
+        # (9) Güven güncellemesi (log_round öncesine alındı; teknik borç için eski değer gerekli).
+        old_a_trust = self.trust["A"]
+        old_b_trust = self.trust["B"]
+        new_a = self._update_trust("A", a_internal, b_action, severity)
+        new_b = self._update_trust("B", b_internal, a_action, severity)
+
+        # (10) Teknik Borç birikimi (V3 — bastırılmış duygu / çözülmemiş gerilim).
+        # Ajan CONCEDE veya WITHDRAW yaptı VE güveni yine de düştüyse, tavize
+        # rağmen içine sindiremediği gerilim miktarı teknik borca eklenir.
+        for _name, _action, _old_t, _new_t in (
+            ("A", a_action, old_a_trust, new_a),
+            ("B", b_action, old_b_trust, new_b),
+        ):
+            if _action in ("CONCEDE", "WITHDRAW") and _new_t < _old_t:
+                self.technical_debt[_name] = round(
+                    self.technical_debt[_name] + (_old_t - _new_t), 4
+                )
+
+        # (11) Yönlü kenarları yaz (teknik borç, tur sonu birikimli değeriyle birlikte).
         await self.db.log_round(
             sim_id=self.sim_id,         round_number=round_number,
             source_agent="A",           target_agent="B",
@@ -343,6 +363,7 @@ class SimulationRunner:
             action=a_action,            reasoning=str(resp["A"].get("Reasoning")),
             symmetry_index=symmetry,    event_id=event_id,
             raw_response=resp["A"].get("raw_response"),
+            technical_debt=self.technical_debt["A"],
         )
         await self.db.log_round(
             sim_id=self.sim_id,         round_number=round_number,
@@ -351,24 +372,34 @@ class SimulationRunner:
             action=b_action,            reasoning=str(resp["B"].get("Reasoning")),
             symmetry_index=symmetry,    event_id=event_id,
             raw_response=resp["B"].get("raw_response"),
+            technical_debt=self.technical_debt["B"],
         )
 
-        # (10) Güven güncellemesi: A'nın güveni B'nin eyleminden etkilenir, vice versa.
-        new_a = self._update_trust("A", a_internal, b_action, severity)
-        new_b = self._update_trust("B", b_internal, a_action, severity)
+        # (12) DB güven ve teknik borç güncellemesi.
         await self.db.update_agent_trust(self.sim_id, "A", new_a)
         await self.db.update_agent_trust(self.sim_id, "B", new_b)
+        await self.db.update_agent_technical_debt(self.sim_id, "A", self.technical_debt["A"])
+        await self.db.update_agent_technical_debt(self.sim_id, "B", self.technical_debt["B"])
 
         logger.info(
-            "[%s] Tur %02d | init=%s | A:%-16s(g=%.1f) B:%-16s(g=%.1f)"
+            "[%s] Tur %02d | init=%s | A:%-16s(g=%.1f d=%.1f) B:%-16s(g=%.1f d=%.1f)"
             " | sev=%.0f sym=%.3f trauma=%s",
             self.label, round_number, first_name,
-            a_action, new_a, b_action, new_b,
+            a_action, new_a, self.technical_debt["A"],
+            b_action, new_b, self.technical_debt["B"],
             severity, symmetry,
             f"tur{past_trauma['round_number']}" if past_trauma else "—",
         )
 
-        # (11) Çıkış koşulları (beklenen terminal durum → FatalSimulationError).
+        # (13) Çıkış koşulları.
+        # Buffer Overflow: birikmiş teknik borç TECHNICAL_DEBT_LIMIT'i aştı.
+        overflow = [n for n in ("A", "B") if self.technical_debt[n] > config.TECHNICAL_DEBT_LIMIT]
+        if overflow:
+            raise FatalSimulationError(
+                f"Teknik Borç Taşması (Buffer Overflow) — Ajan(lar) {', '.join(overflow)}: "
+                f"A_borç={self.technical_debt['A']:.1f}, B_borç={self.technical_debt['B']:.1f} "
+                f"(limit={config.TECHNICAL_DEBT_LIMIT}, tur {round_number})."
+            )
         if a_action == "TERMINATE" or b_action == "TERMINATE":
             who = "A" if a_action == "TERMINATE" else "B"
             raise FatalSimulationError(
@@ -381,12 +412,12 @@ class SimulationRunner:
             )
 
         return {
-            "round":         round_number,
-            "initiative":    first_name,        # bu tur ilk hamleci
-            "A":             {"action": a_action, "trust": round(new_a, 1)},
-            "B":             {"action": b_action, "trust": round(new_b, 1)},
+            "round":          round_number,
+            "initiative":     first_name,
+            "A":              {"action": a_action, "trust": round(new_a, 1), "debt": round(self.technical_debt["A"], 2)},
+            "B":              {"action": b_action, "trust": round(new_b, 1), "debt": round(self.technical_debt["B"], 2)},
             "symmetry_index": symmetry,
-            "severity":      severity,
+            "severity":       severity,
         }
 
     # -- Tüm koşu --------------------------------------------------------
@@ -424,13 +455,17 @@ class SimulationRunner:
             logger.warning("[%s] Bağıntı analizi atlandı: %s", self.label, exc)
 
         return {
-            "label":              self.label,
-            "sim_id":             self.sim_id,
-            "status":             status,
-            "reason":             reason,
-            "rounds_completed":   completed,
-            "influence_edges":    edges,
+            "label":               self.label,
+            "sim_id":              self.sim_id,
+            "status":              status,
+            "reason":              reason,
+            "rounds_completed":    completed,
+            "influence_edges":     edges,
             "relation_properties": relation_props,
+            "pair_type":           (
+                f"{self.cfg.agent_a_archetype.strategy}"
+                f"x{self.cfg.agent_b_archetype.strategy}"
+            ),
         }
 
 
@@ -452,31 +487,128 @@ def _default_pair_configs() -> list[config.SimulationConfig]:
     ]
 
 
+def _batch_pair_configs() -> list[config.SimulationConfig]:
+    """
+    BATCH_SIZE adet Co-op×Zero-Sum + BATCH_SIZE adet Co-op×Co-op config üretir.
+
+    Her simülasyon benzersiz bir random_seed alır (tekrarlanabilirlik + varyasyon).
+    Akademik veri fabrikası modunda istatistiksel anlamlılık için kullanılır.
+    """
+    configs: list[config.SimulationConfig] = []
+    for i in range(config.BATCH_SIZE):
+        configs.append(config.SimulationConfig(
+            agent_a_archetype=config.ARCHETYPE_CO_OP,
+            agent_b_archetype=config.ARCHETYPE_ZERO_SUM,
+            random_seed=1000 + i,
+        ))
+    for i in range(config.BATCH_SIZE):
+        configs.append(config.SimulationConfig(
+            agent_a_archetype=config.ARCHETYPE_CO_OP,
+            agent_b_archetype=config.ARCHETYPE_CO_OP,
+            random_seed=2000 + i,
+        ))
+    return configs
+
+
+async def _run_batch_chunked(
+    runners: list[SimulationRunner],
+    chunk_size: int,
+) -> list[Any]:
+    """
+    SimulationRunner listesini `chunk_size`'lık paketler halinde çalıştırır.
+
+    Semaphore Gemini API eşzamanlılığını sınırlarken, chunk'lama asyncio görev
+    kuyruğunu yönetilebilir tutar ve Ollama üzerindeki ani yükü dağıtır.
+    """
+    all_results: list[Any] = []
+    total      = len(runners)
+    num_chunks = (total + chunk_size - 1) // chunk_size
+    for i in range(0, total, chunk_size):
+        chunk     = runners[i : i + chunk_size]
+        chunk_idx = i // chunk_size + 1
+        logger.info(
+            "=== Batch Chunk %d/%d başlatılıyor (%d simülasyon) ===",
+            chunk_idx, num_chunks, len(chunk),
+        )
+        chunk_results = await asyncio.gather(
+            *(r.run() for r in chunk), return_exceptions=True
+        )
+        all_results.extend(chunk_results)
+        ok = sum(
+            1 for r in chunk_results
+            if isinstance(r, dict) and r.get("status") in ("STABLE", "FATAL")
+        )
+        logger.info(
+            "=== Chunk %d/%d tamamlandı: %d/%d başarılı ===",
+            chunk_idx, num_chunks, ok, len(chunk),
+        )
+    return all_results
+
+
 def _print_report(results: list[Any]) -> None:
+    from collections import Counter
+
     print("\n" + "=" * 72)
     print("SİMÜLASYON RAPORU")
     print("=" * 72)
+
+    successful = [r for r in results if isinstance(r, dict)]
+    errors     = [r for r in results if isinstance(r, BaseException)]
+    verbose    = len(successful) <= 10
+
     for res in results:
         if isinstance(res, BaseException):
             print(f"  [!] Beklenmeyen hata: {res!r}")
             continue
-        print(f"\n  • {res['label']} (sim_id={res['sim_id']})")
-        print(f"      Durum        : {res['status']}")
-        print(f"      Tamamlanan   : {res['rounds_completed']} tur")
-        print(f"      Gerekçe      : {res['reason']}")
-        props = res.get("relation_properties") or {}
-        if props:
+        if verbose:
+            print(f"\n  • {res['label']} (sim_id={res['sim_id']})")
+            print(f"      Durum        : {res['status']}")
+            print(f"      Tamamlanan   : {res['rounds_completed']} tur")
+            print(f"      Gerekçe      : {res['reason']}")
+            props = res.get("relation_properties") or {}
+            if props:
+                print(
+                    "      Bağıntı      : "
+                    f"yansıma={props.get('reflexive')}, "
+                    f"simetri={props.get('symmetric')}, "
+                    f"geçişlilik={props.get('transitive')} "
+                    f"=> denklik={props.get('is_equivalence_relation')}"
+                )
+            if res.get("influence_edges"):
+                print("      Etki Grafı   :", ", ".join(
+                    f"{s}->{t}:{w:.2f}" for s, t, w in res["influence_edges"]
+                ))
+        else:
+            icon = "✓" if res["status"] == "STABLE" else "✗"
             print(
-                "      Bağıntı      : "
-                f"yansıma={props.get('reflexive')}, "
-                f"simetri={props.get('symmetric')}, "
-                f"geçişlilik={props.get('transitive')} "
-                f"=> denklik={props.get('is_equivalence_relation')}"
+                f"  {icon} {res['label']:20s} | {res['status']:6s}"
+                f" | {res['rounds_completed']:3d} tur | {res['reason'][:55]}"
             )
-        if res.get("influence_edges"):
-            print("      Etki Grafı   :", ", ".join(
-                f"{s}->{t}:{w:.2f}" for s, t, w in res["influence_edges"]
-            ))
+
+    if len(successful) > 1:
+        print("\n" + "-" * 72)
+        print("İSTATİSTİKSEL ÖZET")
+        print("-" * 72)
+        status_counts = Counter(r["status"] for r in successful)
+        rounds_vals   = [r["rounds_completed"] for r in successful]
+        print(f"  Toplam           : {len(results)} sim | Hata: {len(errors)}")
+        print(f"  Durum dağılımı   : {dict(status_counts)}")
+        print(
+            f"  Tur istatistiği  : ort={sum(rounds_vals)/len(rounds_vals):.1f}"
+            f"  min={min(rounds_vals)}  max={max(rounds_vals)}"
+        )
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for r in successful:
+            key = r.get("pair_type", "?x?")
+            groups.setdefault(key, []).append(r)
+        for pt, grp in sorted(groups.items()):
+            stable = sum(1 for r in grp if r["status"] == "STABLE")
+            pct    = 100 * stable // len(grp) if grp else 0
+            print(
+                f"  {pt:30s}: {len(grp):3d} sim"
+                f" | STABLE={stable} ({pct}%) | FATAL={len(grp) - stable}"
+            )
+
     print("\n" + "=" * 72 + "\n")
 
 
@@ -512,18 +644,29 @@ async def main() -> None:
 
         try:
             await game_master.start()
-            runners = [
-                SimulationRunner(
+            pair_cfgs = _batch_pair_configs()
+            logger.info(
+                "Batch başlatılıyor: %d simülasyon (%d Co-op×Zero-Sum + %d Co-op×Co-op)"
+                " | chunk_size=%d | semaphore=%d",
+                len(pair_cfgs), config.BATCH_SIZE, config.BATCH_SIZE,
+                config.CHUNK_SIZE, config.GEMINI_MAX_CONCURRENCY,
+            )
+            runners = []
+            for i, cfg in enumerate(pair_cfgs):
+                label = (
+                    f"CZ-{i + 1:03d}"
+                    if i < config.BATCH_SIZE
+                    else f"CC-{i - config.BATCH_SIZE + 1:03d}"
+                )
+                runners.append(SimulationRunner(
                     db=db,
                     game_master=game_master,
                     sim_config=cfg,
                     semaphore=semaphore,
                     validator=validator,
-                    label=f"PAIR-{i+1}:{cfg.agent_a_archetype.strategy}x{cfg.agent_b_archetype.strategy}",
-                )
-                for i, cfg in enumerate(_default_pair_configs())
-            ]
-            results = await asyncio.gather(*(r.run() for r in runners), return_exceptions=True)
+                    label=label,
+                ))
+            results = await _run_batch_chunked(runners, config.CHUNK_SIZE)
             _print_report(results)
         finally:
             await game_master.close()
