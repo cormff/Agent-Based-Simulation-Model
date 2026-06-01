@@ -44,7 +44,7 @@ OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.85"))
 # Ajanlar (Cloud / Gemini API)
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.9"))
 # Aynı anda açık tutulacak en fazla Gemini isteği (proaktif hız sınırlama).
 GEMINI_MAX_CONCURRENCY: int = int(os.getenv("GEMINI_MAX_CONCURRENCY", "4"))

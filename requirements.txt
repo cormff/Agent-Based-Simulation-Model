@@ -1,5 +1,5 @@
-# Cloud ajan karar mekanizması (Gemini API)
-google-generativeai>=0.7.0
+# Cloud ajan karar mekanizması (Gemini API) — yeni google-genai SDK
+google-genai>=1.0.0
 
 # Yerel Game Master (Ollama REST API) ve genel asenkron HTTP istekleri
 aiohttp>=3.9.0
