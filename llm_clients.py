@@ -26,15 +26,20 @@ from typing import Any, Awaitable, Callable, Optional
 import aiohttp
 
 try:
-    import google.generativeai as genai
+    from google import genai as _genai_module
+    from google.genai import types as _genai_types
 
     try:
         from google.api_core import exceptions as gapi_exceptions  # type: ignore
     except ImportError:  # pragma: no cover
         gapi_exceptions = None  # type: ignore
 except ImportError:  # pragma: no cover
-    genai = None  # type: ignore
+    _genai_module = None  # type: ignore
+    _genai_types = None   # type: ignore
     gapi_exceptions = None  # type: ignore
+
+# configure_gemini() tarafından ayarlanan global Gemini istemcisi.
+_gemini_client: Any = None
 
 
 # ===========================================================================
@@ -455,11 +460,12 @@ Yalnızca JSON döndür.
 # 5) Ajan İstemcisi (Cloud / Gemini)
 # ===========================================================================
 def configure_gemini(api_key: str) -> None:
-    if genai is None:
-        raise RuntimeError("google-generativeai kurulu değil: `pip install google-generativeai`")
+    global _gemini_client
+    if _genai_module is None:
+        raise RuntimeError("google-genai kurulu değil: `pip install google-genai`")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY tanımlı değil (.env dosyanızı kontrol edin).")
-    genai.configure(api_key=api_key)
+    _gemini_client = _genai_module.Client(api_key=api_key)
 
 
 class AgentClient:
@@ -484,8 +490,8 @@ class AgentClient:
         base_delay: float,
         max_delay: float,
     ) -> None:
-        if genai is None:
-            raise RuntimeError("google-generativeai kurulu değil.")
+        if _genai_module is None:
+            raise RuntimeError("google-genai kurulu değil: `pip install google-genai`")
         self.name = name
         self.strategy = strategy
         self.semaphore = semaphore
@@ -493,22 +499,21 @@ class AgentClient:
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
-
-        system_instruction = render_agent_system_prompt(strategy, loophole_rate, tolerance)
-        generation_config = genai.types.GenerationConfig(
+        self._model_name = model_name
+        self._gen_config = _genai_types.GenerateContentConfig(
+            system_instruction=render_agent_system_prompt(strategy, loophole_rate, tolerance),
             temperature=temperature,
             response_mime_type="application/json",
-        )
-        self._model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=system_instruction,
-            generation_config=generation_config,
         )
 
     async def _generate_raw(self, prompt: str) -> str:
         async def _call() -> str:
             async with self.semaphore:
-                resp = await self._model.generate_content_async(prompt)
+                resp = await _gemini_client.aio.models.generate_content(
+                    model=self._model_name,
+                    contents=prompt,
+                    config=self._gen_config,
+                )
             try:
                 return resp.text
             except (ValueError, AttributeError):
