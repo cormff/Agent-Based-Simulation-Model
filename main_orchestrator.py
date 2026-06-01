@@ -19,10 +19,11 @@ v2 Mimarisi:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import random
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import config
 from db_manager import (
@@ -156,6 +157,7 @@ class SimulationRunner:
         semaphore: asyncio.Semaphore,
         validator: JSONValidator,
         label: str,
+        observer: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
     ) -> None:
         self.db = db
         self.gm = game_master
@@ -163,6 +165,10 @@ class SimulationRunner:
         self.semaphore = semaphore
         self.validator = validator
         self.label = label
+        # Opsiyonel gözlemci: her tur sonunda tüm iç durumu (kriz, gerekçeler,
+        # güven deltaları, borç, simetri) alır. Yalnızca debug/single modunda
+        # set edilir; batch koşusunda None kalır → davranış değişmez.
+        self.observer = observer
 
         self.sim_id: Optional[int] = None
         self.agents: dict[str, AgentClient] = {}
@@ -391,6 +397,43 @@ class SimulationRunner:
             f"tur{past_trauma['round_number']}" if past_trauma else "—",
         )
 
+        # (12.5) Gözlemci (debug/single mod). Çıkış koşullarından ÖNCE çağrılır;
+        # böylece FATAL'ı tetikleyen tur da (overflow/terminate dahil) izlenebilir.
+        if self.observer is not None:
+            await self.observer({
+                "label":          self.label,
+                "sim_id":         self.sim_id,
+                "round":          round_number,
+                "initiative":     first_name,
+                "crisis": {
+                    "event_text":  crisis.get("event_text"),
+                    "event_type":  crisis.get("event_type"),
+                    "severity":    severity,
+                    "targeted":    crisis.get("targeted_agent"),
+                    "stability":   crisis.get("stability_assessment"),
+                },
+                "past_trauma_round": past_trauma["round_number"] if past_trauma else None,
+                "A": {
+                    "action":      a_action,
+                    "reasoning":   str(resp["A"].get("Reasoning")),
+                    "trust_old":   round(old_a_trust, 2),
+                    "trust_new":   round(new_a, 2),
+                    "trust_delta": round(new_a - old_a_trust, 2),
+                    "debt":        round(self.technical_debt["A"], 2),
+                    "weight":      a_weight,
+                },
+                "B": {
+                    "action":      b_action,
+                    "reasoning":   str(resp["B"].get("Reasoning")),
+                    "trust_old":   round(old_b_trust, 2),
+                    "trust_new":   round(new_b, 2),
+                    "trust_delta": round(new_b - old_b_trust, 2),
+                    "debt":        round(self.technical_debt["B"], 2),
+                    "weight":      b_weight,
+                },
+                "symmetry_index": symmetry,
+            })
+
         # (13) Çıkış koşulları.
         # Buffer Overflow: birikmiş teknik borç TECHNICAL_DEBT_LIMIT'i aştı.
         overflow = [n for n in ("A", "B") if self.technical_debt[n] > config.TECHNICAL_DEBT_LIMIT]
@@ -612,6 +655,162 @@ def _print_report(results: list[Any]) -> None:
     print("\n" + "=" * 72 + "\n")
 
 
+# ===========================================================================
+# Debug / Tek İlişki İzleme (single-run modu)
+# ===========================================================================
+_ARCHETYPE_BY_KEY: dict[str, config.AgentArchetype] = {
+    "CO_OP":    config.ARCHETYPE_CO_OP,
+    "COOP":     config.ARCHETYPE_CO_OP,
+    "C":        config.ARCHETYPE_CO_OP,
+    "ZERO_SUM": config.ARCHETYPE_ZERO_SUM,
+    "ZEROSUM":  config.ARCHETYPE_ZERO_SUM,
+    "Z":        config.ARCHETYPE_ZERO_SUM,
+}
+
+
+def _resolve_archetype(key: str) -> config.AgentArchetype:
+    """'co_op' / 'zero_sum' / 'c' / 'z' gibi serbest girdileri arketipe çevirir."""
+    norm = key.strip().upper().replace("-", "_").replace(" ", "_")
+    if norm not in _ARCHETYPE_BY_KEY:
+        valid = "co_op | zero_sum"
+        raise ValueError(f"Bilinmeyen arketip {key!r}. Geçerli: {valid}")
+    return _ARCHETYPE_BY_KEY[norm]
+
+
+def _make_observer(step: bool) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """
+    Tek-ilişki modunda her tur sonu çağrılan, insan-okur bir konsol gözlemcisi.
+
+    `step=True` ise her turdan sonra duraklar (interaktif adım-adım izleme):
+        [Enter] sonraki tur · 'c' sona kadar devam · 'q' durdur.
+    `step=False` ise yalnızca zengin bir tur özeti basar (otomatik akış).
+    """
+    state = {"continue_to_end": False}
+
+    def _fmt_delta(d: float) -> str:
+        return f"+{d:.1f}" if d >= 0 else f"{d:.1f}"
+
+    async def observer(frame: dict[str, Any]) -> None:
+        cr = frame["crisis"]
+        print("\n" + "─" * 72)
+        print(
+            f"  TUR {frame['round']:02d}  |  ilk hamle: Ajan {frame['initiative']}"
+            f"  |  sim_id={frame['sim_id']}  [{frame['label']}]"
+        )
+        if frame.get("past_trauma_round"):
+            print(f"  ⚠ Geçmiş travma enjekte edildi (kaynak tur {frame['past_trauma_round']})")
+        print("─" * 72)
+        print(
+            f"  KRİZ [{cr['event_type']} · şiddet {cr['severity']:.0f}/10 · "
+            f"hedef {cr['targeted']} · {cr['stability']}]"
+        )
+        print(f"    {cr['event_text']}")
+        for nm in ("A", "B"):
+            ag = frame[nm]
+            print(
+                f"\n  Ajan {nm}: {ag['action']}"
+                f"  (güven {ag['trust_old']:.1f} → {ag['trust_new']:.1f}"
+                f" [{_fmt_delta(ag['trust_delta'])}],"
+                f"  borç {ag['debt']:.1f},  etki {ag['weight']:.2f})"
+            )
+            print(f"    gerekçe: {ag['reasoning']}")
+        print(f"\n  Simetri İndeksi: {frame['symmetry_index']:.3f}")
+        print("─" * 72)
+
+        if not step or state["continue_to_end"]:
+            return
+        # İnteraktif duraklama — event loop'u bloklamamak için thread'e devret.
+        choice = (await asyncio.to_thread(
+            input, "  [Enter]=sonraki tur  ·  c=sona kadar  ·  q=durdur > "
+        )).strip().lower()
+        if choice == "q":
+            raise FatalSimulationError("Kullanıcı debug oturumunu durdurdu (q).")
+        if choice == "c":
+            state["continue_to_end"] = True
+
+    return observer
+
+
+async def run_single(
+    pair: tuple[config.AgentArchetype, config.AgentArchetype],
+    rounds: Optional[int] = None,
+    seed: Optional[int] = 42,
+    step: bool = False,
+    db_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Tek bir ilişkiyi (A-B çifti) izlenebilir biçimde çalıştırır.
+
+    Veri fabrikasını (batch) başlatmadan önce bir senaryoyu canlı izlemek,
+    parametre ayarı yapmak ve gidişata göre müdahale etmek için tasarlanmıştır.
+
+    Args:
+        pair:     (A_arketip, B_arketip) — örn. (CO_OP, ZERO_SUM).
+        rounds:   Maks tur (None → config.MAX_ROUNDS).
+        seed:     Tekrarlanabilirlik için sabit tohum.
+        step:     True → her tur sonunda interaktif duraklama.
+        db_path:  Ayrı bir debug DB yolu (None → config.DB_PATH).
+                  Test koşusunun üretim verisini kirletmemesi için önerilir.
+
+    Batch akışına dokunmaz; mevcut SimulationRunner'ı `observer` ile besler.
+    """
+    a_arch, b_arch = pair
+    sim_cfg = config.SimulationConfig(
+        agent_a_archetype=a_arch,
+        agent_b_archetype=b_arch,
+        max_rounds=rounds if rounds is not None else config.MAX_ROUNDS,
+        random_seed=seed,
+    )
+    label = f"DEBUG:{a_arch.strategy}x{b_arch.strategy}"
+    target_db = db_path or config.DB_PATH
+
+    print("\n" + "=" * 72)
+    print("TEK İLİŞKİ İZLEME MODU (single-run debug)")
+    print("=" * 72)
+    print(f"  Çift        : {a_arch.name} (A) vs {b_arch.name} (B)")
+    print(f"  Maks tur    : {sim_cfg.max_rounds}")
+    print(f"  Tohum (seed): {seed}")
+    print(f"  Adım modu   : {'AÇIK (interaktif)' if step else 'kapalı (otomatik)'}")
+    print(f"  Veritabanı  : {target_db}")
+    print(f"  Eşikler     : güven<{sim_cfg.trust_threshold}  borç>{config.TECHNICAL_DEBT_LIMIT}")
+    print("=" * 72)
+
+    configure_gemini(config.GEMINI_API_KEY)
+    semaphore = asyncio.Semaphore(config.GEMINI_MAX_CONCURRENCY)
+
+    async with DatabaseManager(target_db) as db:
+        game_master = GameMasterClient(
+            base_url=config.OLLAMA_BASE_URL,
+            model=config.OLLAMA_MODEL,
+            temperature=config.OLLAMA_TEMPERATURE,
+            timeout=config.OLLAMA_TIMEOUT,
+            max_retries=config.MAX_RETRIES,
+            base_delay=config.BASE_RETRY_DELAY,
+            max_delay=config.MAX_RETRY_DELAY,
+        )
+        validator = JSONValidator(
+            repair_client=game_master,
+            max_repair_attempts=config.MAX_JSON_REPAIR_ATTEMPTS,
+        )
+        game_master.validator = validator
+        try:
+            await game_master.start()
+            runner = SimulationRunner(
+                db=db,
+                game_master=game_master,
+                sim_config=sim_cfg,
+                semaphore=semaphore,
+                validator=validator,
+                label=label,
+                observer=_make_observer(step),
+            )
+            result = await runner.run()
+            _print_report([result])
+            return result
+        finally:
+            await game_master.close()
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -672,5 +871,87 @@ async def main() -> None:
             await game_master.close()
 
 
+# ===========================================================================
+# CLI giriş noktası
+# ===========================================================================
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "ABM orkestratörü. Varsayılan: tam batch (veri fabrikası). "
+            "--single ile tek bir ilişkiyi izleyip ayar yapabilirsiniz."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Örnekler:\n"
+            "  python main_orchestrator.py                      # tam batch (100 sim)\n"
+            "  python main_orchestrator.py --single             # tek Co-op×Zero-Sum izle\n"
+            "  python main_orchestrator.py --single --step      # adım-adım (Enter ile ilerle)\n"
+            "  python main_orchestrator.py --single --pair co_op co_op --rounds 12\n"
+            "  python main_orchestrator.py --single --db debug.db --seed 7\n"
+        ),
+    )
+    parser.add_argument(
+        "--single", action="store_true",
+        help="Tek bir ilişkiyi izleme modunda çalıştır (batch yerine).",
+    )
+    parser.add_argument(
+        "--pair", nargs=2, metavar=("A", "B"), default=["co_op", "zero_sum"],
+        help="Ajan arketipleri: co_op | zero_sum (varsayılan: co_op zero_sum).",
+    )
+    parser.add_argument(
+        "--rounds", type=int, default=None,
+        help=f"Maks tur sayısı (varsayılan: config.MAX_ROUNDS={config.MAX_ROUNDS}).",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Tekrarlanabilirlik için rastgele tohum (varsayılan: 42).",
+    )
+    parser.add_argument(
+        "--step", action="store_true",
+        help="Adım-adım mod: her turdan sonra interaktif duraklama.",
+    )
+    parser.add_argument(
+        "--db", default=None,
+        help="Ayrı debug veritabanı yolu (üretim verisini kirletmemek için).",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="DEBUG seviye loglama (travma enjeksiyonu vb. ayrıntılar).",
+    )
+    return parser
+
+
+def _run_cli() -> None:
+    args = _build_arg_parser().parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if not args.single:
+        asyncio.run(main())
+        return
+
+    try:
+        pair = (_resolve_archetype(args.pair[0]), _resolve_archetype(args.pair[1]))
+    except ValueError as exc:
+        raise SystemExit(f"[HATA] {exc}")
+
+    try:
+        asyncio.run(run_single(
+            pair=pair,
+            rounds=args.rounds,
+            seed=args.seed,
+            step=args.step,
+            db_path=args.db,
+        ))
+    except RuntimeError as exc:
+        # configure_gemini başarısızsa (API anahtarı yok) anlamlı bir mesaj ver.
+        raise SystemExit(f"[HATA] {exc}")
+    except KeyboardInterrupt:
+        print("\n[İPTAL] Debug oturumu kullanıcı tarafından kesildi.")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    _run_cli()
